@@ -2,12 +2,13 @@
 import os
 from ultralytics import YOLO
 import onnx
+from pathlib import Path
 from extra.onnx import get_run_onnx
 from tinygrad.tensor import Tensor
 
 os.chdir("/tmp")
-if not os.path.isfile("yolov8n-seg.onnx"):
-  model = YOLO("yolov8n-seg.pt") 
+if not Path("yolov8n-seg.onnx").is_file():
+  model = YOLO("yolov8n-seg.pt")
   model.export(format="onnx", imgsz=[480,640])
 onnx_model = onnx.load(open("yolov8n-seg.onnx", "rb"))
 # TODO: move get example inputs to onnx

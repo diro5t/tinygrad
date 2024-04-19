@@ -1,21 +1,18 @@
 # https://arxiv.org/pdf/2112.10752.pdf
 # https://github.com/ekagra-ranjan/huggingface-blog/blob/main/stable_diffusion.md
-import os
 import tempfile
 from pathlib import Path
 import gzip, argparse, math, re
 from functools import lru_cache
 from collections import namedtuple
 
+from PIL import Image
 import numpy as np
 from tqdm import tqdm
-
-from tinygrad.tensor import Tensor
-from tinygrad.nn import Conv2d, Linear, GroupNorm, LayerNorm
-from extra.utils import download_file
-from tinygrad.state import torch_load, load_state_dict
-
-# TODO: refactor AttnBlock, CrossAttention, CLIPAttention to share code
+from tinygrad import Device, GlobalCounters, dtypes, Tensor, TinyJit
+from tinygrad.helpers import Timing, Context, getenv, fetch, colored
+from tinygrad.nn import Conv2d, Linear, GroupNorm, LayerNorm, Embedding
+from tinygrad.nn.state import torch_load, load_state_dict, get_state_dict
 
 class AttnBlock:
   def __init__(self, in_channels):
@@ -32,19 +29,8 @@ class AttnBlock:
 
     # compute attention
     b,c,h,w = q.shape
-    q = q.reshape(b,c,h*w)
-    q = q.permute(0,2,1)   # b,hw,c
-    k = k.reshape(b,c,h*w) # b,c,hw
-    w_ = q @ k
-    w_ = w_ * (c**(-0.5))
-    w_ = w_.softmax()
-
-    # attend to values
-    v = v.reshape(b,c,h*w)
-    w_ = w_.permute(0,2,1)
-    h_ = v @ w_
-    h_ = h_.reshape(b,c,h,w)
-
+    q,k,v = [x.reshape(b,c,h*w).transpose(1,2) for x in (q,k,v)]
+    h_ = Tensor.scaled_dot_product_attention(q,k,v).transpose(1,2).reshape(b,c,h,w)
     return x + self.proj_out(h_)
 
 class ResnetBlock:
@@ -102,7 +88,6 @@ class Decoder:
       x.realize()
 
     return self.conv_out(self.norm_out(x).swish())
-
 
 class Encoder:
   def __init__(self):
@@ -180,7 +165,6 @@ class CrossAttention:
     self.to_q = Linear(query_dim, n_heads*d_head, bias=False)
     self.to_k = Linear(context_dim, n_heads*d_head, bias=False)
     self.to_v = Linear(context_dim, n_heads*d_head, bias=False)
-    self.scale = d_head ** -0.5
     self.num_heads = n_heads
     self.head_size = d_head
     self.to_out = [Linear(n_heads*d_head, query_dim)]
@@ -188,15 +172,9 @@ class CrossAttention:
   def __call__(self, x, context=None):
     context = x if context is None else context
     q,k,v = self.to_q(x), self.to_k(context), self.to_v(context)
-    q = q.reshape(x.shape[0], -1, self.num_heads, self.head_size).permute(0,2,1,3)  # (bs, num_heads, time, head_size)
-    k = k.reshape(x.shape[0], -1, self.num_heads, self.head_size).permute(0,2,3,1)  # (bs, num_heads, head_size, time)
-    v = v.reshape(x.shape[0], -1, self.num_heads, self.head_size).permute(0,2,1,3)  # (bs, num_heads, time, head_size)
-
-    score = q.dot(k) * self.scale
-    weights = score.softmax()                     # (bs, num_heads, time, time)
-    attention = weights.dot(v).permute(0,2,1,3)   # (bs, time, num_heads, head_size)
-
-    h_ = attention.reshape(shape=(x.shape[0], -1, self.num_heads * self.head_size))
+    q,k,v = [y.reshape(x.shape[0], -1, self.num_heads, self.head_size).transpose(1,2) for y in (q,k,v)]
+    attention = Tensor.scaled_dot_product_attention(q, k, v).transpose(1,2)
+    h_ = attention.reshape(x.shape[0], -1, self.num_heads * self.head_size)
     return h_.sequential(self.to_out)
 
 class GEGLU:
@@ -272,10 +250,10 @@ class Upsample:
 
 def timestep_embedding(timesteps, dim, max_period=10000):
   half = dim // 2
-  freqs = np.exp(-math.log(max_period) * np.arange(0, half, dtype=np.float32) / half)
+  # TODO: remove explicit dtypes after broadcast fix
+  freqs = (-math.log(max_period) * Tensor.arange(half, dtype=dtypes.float32) / half).exp()
   args = timesteps * freqs
-  embedding = np.concatenate([np.cos(args), np.sin(args)])
-  return Tensor(embedding).reshape(1, -1)
+  return Tensor.cat(args.cos(), args.sin()).reshape(1, -1)
 
 class UNetModel:
   def __init__(self):
@@ -340,7 +318,6 @@ class UNetModel:
       for bb in b:
         x = run(x, bb)
       saved_inputs.append(x)
-      x.realize()
     for bb in self.middle_block:
       x = run(x, bb)
     for i,b in enumerate(self.output_blocks):
@@ -348,7 +325,6 @@ class UNetModel:
       x = x.cat(saved_inputs.pop(), dim=1)
       for bb in b:
         x = run(x, bb)
-      x.realize()
     return x.sequential(self.out)
 
 class CLIPMLP:
@@ -367,43 +343,17 @@ class CLIPAttention:
     self.embed_dim = 768
     self.num_heads = 12
     self.head_dim = self.embed_dim // self.num_heads
-    self.scale = self.head_dim**-0.5
     self.k_proj = Linear(self.embed_dim, self.embed_dim)
     self.v_proj = Linear(self.embed_dim, self.embed_dim)
     self.q_proj = Linear(self.embed_dim, self.embed_dim)
     self.out_proj = Linear(self.embed_dim, self.embed_dim)
 
-  def _shape(self, tensor, seq_len: int, bsz: int):
-    return tensor.reshape(bsz, seq_len, self.num_heads, self.head_dim).permute(0,2,1,3)
-
   def __call__(self, hidden_states, causal_attention_mask):
     bsz, tgt_len, embed_dim = hidden_states.shape
-
-    query_states = self.q_proj(hidden_states) * self.scale
-    key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
-    value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
-
-    proj_shape = (bsz * self.num_heads, -1, self.head_dim)
-    query_states = self._shape(query_states, tgt_len, bsz).reshape(*proj_shape)
-    key_states = key_states.reshape(*proj_shape)
-    src_len = key_states.shape[1]
-    value_states = value_states.reshape(*proj_shape)
-
-    attn_weights = query_states @ key_states.permute(0,2,1)
-
-    attn_weights = attn_weights.reshape(bsz, self.num_heads, tgt_len, src_len) + causal_attention_mask
-    attn_weights = attn_weights.reshape(bsz * self.num_heads, tgt_len, src_len)
-
-    attn_weights = attn_weights.softmax()
-
-    attn_output = attn_weights @ value_states
-
-    attn_output = attn_output.reshape(bsz, self.num_heads, tgt_len, self.head_dim)
-    attn_output = attn_output.permute(0,2,1,3)
-    attn_output = attn_output.reshape(bsz, tgt_len, embed_dim)
-
-    attn_output = self.out_proj(attn_output)
-    return attn_output
+    q,k,v = self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+    q,k,v = [x.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2) for x in (q,k,v)]
+    attn_output = Tensor.scaled_dot_product_attention(q, k, v, attn_mask=causal_attention_mask)
+    return self.out_proj(attn_output.transpose(1, 2).reshape(bsz, tgt_len, embed_dim))
 
 class CLIPEncoderLayer:
   def __init__(self):
@@ -436,19 +386,11 @@ class CLIPEncoder:
 
 class CLIPTextEmbeddings:
   def __init__(self):
-    #self.position_ids = Tensor.empty(1, 77)  # what is this?
-    self.token_embedding = {"weight": Tensor.empty(49408, 768)}
-    self.position_embedding = {"weight": Tensor.empty(77, 768)}
+    self.token_embedding = Embedding(49408, 768)
+    self.position_embedding = Embedding(77, 768)
 
   def __call__(self, input_ids, position_ids):
-    # TODO: actually support batches
-    inputs = np.zeros((1, len(input_ids), 49408), dtype=np.float32)
-    positions = np.zeros((1, len(position_ids), 77), dtype=np.float32)
-    for i,x in enumerate(input_ids): inputs[0][i][x] = 1
-    for i,x in enumerate(position_ids): positions[0][i][x] = 1
-    inputs_embeds = Tensor(inputs, device=self.token_embedding['weight'].device) @ self.token_embedding['weight']
-    position_embeddings = Tensor(positions, device=self.position_embedding['weight'].device) @ self.position_embedding['weight']
-    return inputs_embeds + position_embeddings
+    return self.token_embedding(input_ids) + self.position_embedding(position_ids)
 
 class CLIPTextTransformer:
   def __init__(self):
@@ -457,16 +399,13 @@ class CLIPTextTransformer:
     self.final_layer_norm = LayerNorm(768)
 
   def __call__(self, input_ids):
-    x = self.embeddings(input_ids, list(range(len(input_ids))))
-    causal_attention_mask = np.triu(np.ones((1,1,77,77), dtype=np.float32) * -np.inf, k=1)
-    x = self.encoder(x, Tensor(causal_attention_mask, device=x.device))
-    # x = self.encoder(x, Tensor.full((1, 1, 77, 77), float("-inf")).triu(1)) # TODO: Pending(#942)
+    x = self.embeddings(input_ids, Tensor.arange(input_ids.shape[1]).reshape(1, -1))
+    x = self.encoder(x, Tensor.full((1, 1, 77, 77), float("-inf")).triu(1))
     return self.final_layer_norm(x)
 
 # Clip tokenizer, taken from https://github.com/openai/CLIP/blob/main/clip/simple_tokenizer.py (MIT license)
 @lru_cache()
-def default_bpe():
-  return Path(__file__).parent.parent / "weights/bpe_simple_vocab_16e6.txt.gz"
+def default_bpe(): return fetch("https://github.com/openai/CLIP/raw/main/clip/bpe_simple_vocab_16e6.txt.gz", "bpe_simple_vocab_16e6.txt.gz")
 
 def get_pairs(word):
   """Return set of symbol pairs in a word.
@@ -490,7 +429,7 @@ def bytes_to_unicode():
   The reversible bpe codes work on unicode strings.
   This means you need a large # of unicode characters in your vocab if you want to avoid UNKs.
   When you're at something like a 10B token dataset you end up needing around 5K for decent coverage.
-  This is a signficant percentage of your normal, say, 32K bpe vocab.
+  This is a significant percentage of your normal, say, 32K bpe vocab.
   To avoid that, we want lookup tables between utf-8 bytes and unicode strings.
   And avoids mapping to whitespace/control characters the bpe code barfs on.
   """
@@ -572,14 +511,58 @@ class ClipTokenizer:
       bpe_tokens = bpe_tokens[:75]
     return [49406] + bpe_tokens + [49407] * (77 - len(bpe_tokens) - 1)
 
+
+def get_alphas_cumprod(beta_start=0.00085, beta_end=0.0120, n_training_steps=1000):
+  betas = np.linspace(beta_start ** 0.5, beta_end ** 0.5, n_training_steps, dtype=np.float32) ** 2
+  alphas = 1.0 - betas
+  alphas_cumprod = np.cumprod(alphas, axis=0)
+  return Tensor(alphas_cumprod)
+
 class StableDiffusion:
   def __init__(self):
-    self.alphas_cumprod = Tensor.empty(1000)
+    self.alphas_cumprod = get_alphas_cumprod()
     self.model = namedtuple("DiffusionModel", ["diffusion_model"])(diffusion_model = UNetModel())
     self.first_stage_model = AutoencoderKL()
     self.cond_stage_model = namedtuple("CondStageModel", ["transformer"])(transformer = namedtuple("Transformer", ["text_model"])(text_model = CLIPTextTransformer()))
 
-  # TODO: make __call__ run the model
+  def get_x_prev_and_pred_x0(self, x, e_t, a_t, a_prev):
+    temperature = 1
+    sigma_t = 0
+    sqrt_one_minus_at = (1-a_t).sqrt()
+    #print(a_t, a_prev, sigma_t, sqrt_one_minus_at)
+
+    pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
+
+    # direction pointing to x_t
+    dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
+
+    x_prev = a_prev.sqrt() * pred_x0 + dir_xt
+    return x_prev, pred_x0
+
+  def get_model_output(self, unconditional_context, context, latent, timestep, unconditional_guidance_scale):
+    # put into diffuser
+    latents = self.model.diffusion_model(latent.expand(2, *latent.shape[1:]), timestep, unconditional_context.cat(context, dim=0))
+    unconditional_latent, latent = latents[0:1], latents[1:2]
+
+    e_t = unconditional_latent + unconditional_guidance_scale * (latent - unconditional_latent)
+    return e_t
+
+  def decode(self, x):
+    x = self.first_stage_model.post_quant_conv(1/0.18215 * x)
+    x = self.first_stage_model.decoder(x)
+
+    # make image correct size and scale
+    x = (x + 1.0) / 2.0
+    x = x.reshape(3,512,512).permute(1,2,0).clip(0,1)*255
+    return x.cast(dtypes.uint8) if Device.DEFAULT != "WEBGPU" else x
+
+  def __call__(self, unconditional_context, context, latent, timestep, alphas, alphas_prev, guidance):
+    e_t = self.get_model_output(unconditional_context, context, latent, timestep, guidance)
+    x_prev, _ = self.get_x_prev_and_pred_x0(latent, e_t, alphas, alphas_prev)
+    #e_t_next = get_model_output(x_prev)
+    #e_t_prime = (e_t + e_t_next) / 2
+    #x_prev, pred_x0 = get_x_prev_and_pred_x0(latent, e_t_prime, index)
+    return x_prev.realize()
 
 # ** ldm.models.autoencoder.AutoencoderKL (done!)
 # 3x512x512 <--> 4x64x64 (16384)
@@ -597,97 +580,79 @@ class StableDiffusion:
 # ** ldm.modules.encoders.modules.FrozenCLIPEmbedder
 # cond_stage_model.transformer.text_model
 
-# this is sd-v1-4.ckpt
-#FILENAME = "/Users/kafka/fun/mps/stable-diffusion/models/ldm/stable-diffusion-v1/model.ckpt"
-#FILENAME = "/home/kafka/model.ckpt"
-FILENAME = Path(__file__).parent.parent / "weights/sd-v1-4.ckpt"
-
 if __name__ == "__main__":
+  default_prompt = "a horse sized cat eating a bagel"
   parser = argparse.ArgumentParser(description='Run Stable Diffusion', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
   parser.add_argument('--steps', type=int, default=5, help="Number of steps in diffusion")
-  parser.add_argument('--prompt', type=str, default="a horse sized cat eating a bagel", help="Phrase to render")
-  parser.add_argument('--out', type=str, default=os.path.join(tempfile.gettempdir(), "rendered.png"), help="Output filename")
+  parser.add_argument('--prompt', type=str, default=default_prompt, help="Phrase to render")
+  parser.add_argument('--out', type=str, default=Path(tempfile.gettempdir()) / "rendered.png", help="Output filename")
+  parser.add_argument('--noshow', action='store_true', help="Don't show the image")
+  parser.add_argument('--fp16', action='store_true', help="Cast the weights to float16")
+  parser.add_argument('--timing', action='store_true', help="Print timing per step")
+  parser.add_argument('--seed', type=int, help="Set the random latent seed")
+  parser.add_argument('--guidance', type=float, default=7.5, help="Prompt strength")
   args = parser.parse_args()
 
   Tensor.no_grad = True
   model = StableDiffusion()
 
   # load in weights
-  download_file('https://huggingface.co/CompVis/stable-diffusion-v-1-4-original/resolve/main/sd-v1-4.ckpt', FILENAME)
-  load_state_dict(model, torch_load(FILENAME)['state_dict'], strict=False)
+  load_state_dict(model, torch_load(fetch('https://huggingface.co/CompVis/stable-diffusion-v-1-4-original/resolve/main/sd-v1-4.ckpt', 'sd-v1-4.ckpt'))['state_dict'], strict=False)
+
+  if args.fp16:
+    for l in get_state_dict(model).values():
+      l.replace(l.cast(dtypes.float16).realize())
 
   # run through CLIP to get context
   tokenizer = ClipTokenizer()
-  prompt = tokenizer.encode(args.prompt)
+  prompt = Tensor([tokenizer.encode(args.prompt)])
   context = model.cond_stage_model.transformer.text_model(prompt).realize()
   print("got CLIP context", context.shape)
 
-  prompt = tokenizer.encode("")
+  prompt = Tensor([tokenizer.encode("")])
   unconditional_context = model.cond_stage_model.transformer.text_model(prompt).realize()
   print("got unconditional CLIP context", unconditional_context.shape)
 
   # done with clip model
   del model.cond_stage_model
 
-  def get_model_output(latent, timesteps):
-    # put into diffuser
-    unconditional_latent = model.model.diffusion_model(latent, timesteps, unconditional_context).realize()
-    latent = model.model.diffusion_model(latent, timesteps, context).realize()
-
-    unconditional_guidance_scale = 7.5
-    e_t = unconditional_latent + unconditional_guidance_scale * (latent - unconditional_latent)
-    return e_t
-
-  timesteps = list(np.arange(1, 1000, 1000//args.steps))
+  timesteps = list(range(1, 1000, 1000//args.steps))
   print(f"running for {timesteps} timesteps")
-  alphas = [model.alphas_cumprod.numpy()[t] for t in timesteps]
-  alphas_prev = [1.0] + alphas[:-1]
-
-  def get_x_prev_and_pred_x0(x, e_t, index):
-    temperature = 1
-    a_t, a_prev = alphas[index], alphas_prev[index]
-    sigma_t = 0
-    sqrt_one_minus_at = math.sqrt(1-a_t)
-    sqrt_one_minus_at = Tensor([sqrt_one_minus_at]).realize()  # don't constant fold this
-    #print(a_t, a_prev, sigma_t, sqrt_one_minus_at)
-
-    pred_x0 = (x - sqrt_one_minus_at * e_t) / math.sqrt(a_t)
-
-    # direction pointing to x_t
-    dir_xt = math.sqrt(1. - a_prev - sigma_t**2) * e_t
-    noise = sigma_t * Tensor.randn(*x.shape) * temperature
-
-    x_prev = math.sqrt(a_prev) * pred_x0 + dir_xt #+ noise
-    return x_prev, pred_x0
+  alphas = model.alphas_cumprod[Tensor(timesteps)]
+  alphas_prev = Tensor([1.0]).cat(alphas[:-1])
 
   # start with random noise
+  if args.seed is not None: Tensor._seed = args.seed
   latent = Tensor.randn(1,4,64,64)
 
+  @TinyJit
+  def run(model, *x): return model(*x).realize()
+
   # this is diffusion
-  for index, timestep in (t:=tqdm(list(enumerate(timesteps))[::-1])):
-    t.set_description("%3d %3d" % (index, timestep))
-    e_t = get_model_output(latent, timestep)
-    x_prev, pred_x0 = get_x_prev_and_pred_x0(latent, e_t, index)
-    #e_t_next = get_model_output(x_prev)
-    #e_t_prime = (e_t + e_t_next) / 2
-    #x_prev, pred_x0 = get_x_prev_and_pred_x0(latent, e_t_prime, index)
-    latent = x_prev
-    latent.realize()
+  with Context(BEAM=getenv("LATEBEAM")):
+    for index, timestep in (t:=tqdm(list(enumerate(timesteps))[::-1])):
+      GlobalCounters.reset()
+      t.set_description("%3d %3d" % (index, timestep))
+      with Timing("step in ", enabled=args.timing, on_exit=lambda _: f", using {GlobalCounters.mem_used/1e9:.2f} GB"):
+        tid = Tensor([index])
+        latent = run(model, unconditional_context, context, latent, Tensor([timestep]), alphas[tid], alphas_prev[tid], Tensor([args.guidance]))
+        if args.timing: Device[Device.DEFAULT].synchronize()
+    del run
 
   # upsample latent space to image with autoencoder
-  x = model.first_stage_model.post_quant_conv(1/0.18215 * latent)
-  x = model.first_stage_model.decoder(x)
-
-  # make image correct size and scale
-  x = (x + 1.0) / 2.0
-  x = x.reshape(3,512,512).permute(1,2,0)
-  dat = (x.detach().numpy().clip(0, 1)*255).astype(np.uint8)
-  print(dat.shape)
+  x = model.decode(latent)
+  print(x.shape)
 
   # save image
-  from PIL import Image
-  im = Image.fromarray(dat)
+  im = Image.fromarray(x.numpy().astype(np.uint8, copy=False))
   print(f"saving {args.out}")
   im.save(args.out)
   # Open image.
-  im.show()
+  if not args.noshow: im.show()
+
+  # validation!
+  if args.prompt == default_prompt and args.steps == 5 and args.seed == 0 and args.guidance == 7.5:
+    ref_image = Tensor(np.array(Image.open(Path(__file__).parent / "stable_diffusion_seed0.png")))
+    distance = (((x - ref_image).cast(dtypes.float) / ref_image.max())**2).mean().item()
+    assert distance < 3e-4, f"validation failed with {distance=}"
+    print(colored(f"output validated with {distance=}", "green"))
